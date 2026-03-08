@@ -1,0 +1,38 @@
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+
+# Large binary files
+*.mp4
+*.zip
+*.mat
+*.slx
+*.prj
+*.mlproj
+*.wrl
+
+# Simulink work directory
+**/work/
+
+# MATLAB project resources
+**/resources/project/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python bytecode
+*.pyc
+*.pyo
+
+# Output images (keep only in repo if needed)
+# *.jpg
+# *.png
+# *.npy
