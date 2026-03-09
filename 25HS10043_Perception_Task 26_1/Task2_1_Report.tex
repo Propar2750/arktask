@@ -1,0 +1,284 @@
+\documentclass[conference, twocolumn]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{gensymb}
+
+% Code listing style
+\lstset{
+  language=Matlab,
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{red},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\title{Aerial Robotics Kharagpur Documentation\\Task 2.1 -- Drone Line Follower}
+
+\author{Parv Chopra *}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+%  ABSTRACT
+% ============================================================================
+\begin{abstract}
+This report presents an image-based line-following algorithm for a Parrot Mambo minidrone. The drone's downward-facing camera provides $120\times160$ RGB frames; the algorithm detects a red line and outputs a unit steering vector $(X, Y)$ to guide the drone along the line. Three approaches were developed: a $7\times7$ grid-based scanner, a 3-strip tangent method, and a global+perpendicular centroid method with heading-aware blending. The final algorithm handles turns exceeding $100\degree$ with no directional bias, operates entirely with fixed-size arrays for Simulink compatibility, and maintains a persistent heading to prevent oscillation.
+\end{abstract}
+
+% ============================================================================
+%  I. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+
+The objective of Task~2.1 is to steer a drone so that it follows a red line painted on the ground. The input to the algorithm is three $120\times160$ \texttt{uint8} arrays (R, G, B channels from the downward camera), and the output is a unit vector $(X, Y)$ where $X$ points upward in the image (forward in the drone's frame) and $Y$ points rightward.
+
+Key challenges include:
+\begin{itemize}
+    \item \textbf{Sharp turns} exceeding $100\degree$ where the line bends sharply.
+    \item \textbf{Simulink compatibility}: the algorithm runs inside a MATLAB Function block, so all arrays must be compile-time fixed-size --- no \texttt{find()}, \texttt{sort()}, \texttt{diff()}, or variable-length logical indexing.
+    \item \textbf{Direction independence}: the algorithm must treat all headings equally with no built-in ``north = forward'' assumption.
+    \item \textbf{Oscillation prevention}: a purely per-frame algorithm (no memory) would jitter on straight lines or flip at corners, so some form of frame-to-frame state is needed.
+\end{itemize}
+
+% ============================================================================
+%  II. PROBLEM STATEMENT
+% ============================================================================
+\section{Problem Statement}
+
+Given per-frame R, G, B arrays of size $120\times160$ (\texttt{uint8}), detect a red line in the image and output a unit vector $(X, Y)$ indicating the direction the drone should steer to follow the line. The algorithm must:
+
+\begin{enumerate}
+    \item Detect red pixels reliably using thresholds: $R > 180$, $G < 100$, $B < 100$.
+    \item Determine the line's direction relative to the drone.
+    \item Handle turns from gentle curves to sharp corners exceeding $100\degree$.
+    \item Operate with only fixed-size arrays (Simulink constraint).
+    \item Be direction-independent --- no axis is privileged as ``forward.''
+\end{enumerate}
+
+% ============================================================================
+%  III. RELATED WORK
+% ============================================================================
+\section{Related Work}
+
+\textbf{Centroid-based line following} is common in ground robots --- compute the centroid of detected line pixels and steer toward it. Simple but fails at sharp turns where the centroid averages both branches.
+
+\textbf{Hough Line Transform} detects line parameters $(\rho, \theta)$ but requires variable-size arrays and is computationally heavy for real-time drone control.
+
+\textbf{Strip-based methods} divide the image into horizontal strips and compute per-strip centroids. The tangent between adjacent centroids gives the line direction. Used in many line-following competitions.
+
+\textbf{PID controllers} are often used downstream of the vision algorithm to smooth steering. Not used here since the output is a direction vector, not a motor command.
+
+% ============================================================================
+%  IV. INITIAL ATTEMPTS
+% ============================================================================
+\section{Initial Attempts}
+
+\subsection{Attempt 1: 7$\times$7 Grid Scanner (\texttt{lineFollower.m})}
+
+The image was cropped to $119\times119$ and divided into a $7\times7$ grid of $17\times17$ blocks. Each block was classified as ``line present'' if the red pixel count exceeded a threshold. Starting from the centre block $(4,4)$, a compass-based scan searched for the next line block in 8 directions, prioritising the last known heading.
+
+\textbf{Algorithm:}
+\begin{enumerate}
+    \item Centre-crop the $120\times160$ image to $119\times119$ (rows~$1$--$119$, columns~$21$--$139$). Since $119 = 7 \times 17$, each grid block is exactly $17\times17$ pixels.
+    \item Create a binary red mask: $R > 180 \;\wedge\; G < 100 \;\wedge\; B < 100$.
+    \item Count red pixels in each of the 49 blocks.
+    \item Define 8 compass directions (N, NE, E, SE, S, SW, W, NW) mapping to the ring-1 neighbours of centre block $(4,4)$.
+    \item Scan ring-1 blocks in priority order based on \texttt{lastDir}, checking forward directions first:
+    \begin{equation}
+        s(p) = ((d - 1 + b(p)) \bmod 8) + 1
+    \end{equation}
+    where $s = \texttt{scanOrder}$, $d = \texttt{lastDir}$, $b = \texttt{baseOff}$,
+    where $\texttt{baseOff} = [0, 1, 7, 2, 6]$ restricts scanning to the forward $\pm90\degree$ cone.
+    \item The first block exceeding threshold $T = 0.10 \times 17 \times 17 \approx 29$ pixels wins.
+    \item Steer toward the chosen block's geometric centre.
+\end{enumerate}
+
+\textbf{Strengths:} Simple, intuitive, works for moderate turns.
+
+\textbf{Weaknesses:}
+\begin{itemize}
+    \item Quantised to 8 directions ($45\degree$ resolution) --- poor angle accuracy.
+    \item Initial forward-cone bug included $\pm135\degree$ directions, causing U-turns (fixed by limiting to $\pm90\degree$).
+\end{itemize}
+
+\subsection{Attempt 2: 3-Strip Tangent Method (\texttt{lineFollower2.m})}
+
+The image was divided into 3 horizontal strips of 40 rows each. The column centroid of red pixels in each strip was computed, and the tangent vector between strip centroids gave the line direction.
+
+\textbf{Strip layout:}
+\begin{itemize}
+    \item Strip A (far): rows $1$--$40$, centroid row $= 20$.
+    \item Strip B (mid): rows $41$--$80$, centroid row $= 60$.
+    \item Strip C (near): rows $81$--$120$, centroid row $= 100$.
+\end{itemize}
+
+\textbf{Steering logic:}
+\begin{itemize}
+    \item If both far and near strips are visible: $\vec{s} = (80,\; c_{\mathrm{far}} - c_{\mathrm{near}})$.
+    \item If only mid and near: $\vec{s} = (40,\; c_{\mathrm{mid}} - c_{\mathrm{near}})$.
+    \item If only near: lateral correction $\vec{s} = (40,\; c_{\mathrm{near}} - 80)$.
+\end{itemize}
+
+The output angle is:
+\begin{equation}
+    \theta = \arctan\!\left(\frac{c_{\mathrm{far}} - c_{\mathrm{near}}}{80}\right)
+\end{equation}
+giving exact (unquantised) angular accuracy from the column-centroid difference over the 80-row strip separation.
+
+\textbf{Strengths:} Much better angle accuracy ($\sim5\degree$) than the grid method. Simple and fast.
+
+\textbf{Weaknesses:} Struggles on steep turns ($>60\degree$) where the line runs nearly vertically --- horizontal strips see diminishing lateral offset, and fails entirely beyond $\sim90\degree$.
+
+\subsection{General Observation}
+
+An unexpected pattern across both attempts: restricting the field of view to a small region immediately ahead of the drone made steering easier, much like a ground robot with only a few colour sensors in a line in front of it. With a small, local window the mapping from sensory input to steering output is almost trivial --- the line is either left, centre, or right. With the full $120\times160$ image, the algorithm sees both the old and new branches at corners, the line's curvature, and noise, all at once. Naively using more data made the problem harder rather than easier, because averaging or scanning over the full image mixes conflicting directional cues. Rather than falling back to a local-only approach, I chose to treat this as a challenge and attempt to make the global data work. The final approach (Section~V) projects all pixels relative to the current heading to separate useful signal from noise, but due to time constraints the algorithm was not refined enough to fully match the robustness of simpler local methods at extreme turn angles.
+
+% ============================================================================
+%  V. FINAL APPROACH
+% ============================================================================
+\section{Final Approach}
+
+\subsection{Algorithm: Global + Perpendicular Centroid with Heading-Aware Blending (\texttt{lineFollower3.m})}
+
+The final algorithm computes two heading-relative centroids and blends them based on how much of the line is ahead vs.\ behind. A global centroid serves as a fallback when data is insufficient.
+
+\textbf{Step 1 --- Red Mask.}
+A binary $120\times160$ mask of red pixels:
+\begin{equation}
+    m_{ij} = \mathbb{1}[R_{ij}>180 \wedge G_{ij}<100 \wedge B_{ij}<100]
+\end{equation}
+
+\textbf{Step 2 --- Global Centroid.}
+Compute the centroid of all red pixels using column/row projection sums:
+\begin{align}
+    c_{\mathrm{col}} &= \frac{\sum_{j} \bigl(\sum_{i} m_{ij}\bigr) \cdot j}{N} \\[4pt]
+    c_{\mathrm{row}} &= \frac{\sum_{i} \bigl(\sum_{j} m_{ij}\bigr) \cdot i}{N}
+\end{align}
+where $N$ is the total number of red pixels.
+
+\textbf{Step 3 --- Ahead Centroid.}
+For each pixel, compute its signed projection onto the persistent heading vector $(\texttt{dirX}, \texttt{dirY})$:
+\begin{equation}
+    \texttt{proj}(i,j) = (c_r - i)\,\texttt{dirX} + (j - c_c)\,\texttt{dirY}
+\end{equation}
+where $(c_r, c_c) = (60, 80)$ is the image centre. Pixels with $\texttt{proj} > 0$ are ``ahead.'' The weighted centroid of $\texttt{mask} \cdot \max(0,\, \texttt{proj}+1)$ gives the ahead centroid. On straight lines, this dominates steering.
+
+\textbf{Step 4 --- Perpendicular Centroid.}
+Compute each pixel's perpendicular distance from the heading axis:
+\begin{equation}
+    d_\perp(i,j) = (c_r - i)(-\texttt{dirY}) + (j - c_c)\,\texttt{dirX}
+\end{equation}
+Weight by $|d_\perp|$ to emphasise pixels far from the heading line. At a sharp corner ($>90\degree$), the new branch sticks out sideways giving high perpendicular weight, so this centroid points toward the new branch.
+
+\textbf{Step 5 --- Adaptive Blending.}
+\begin{align}
+    \beta &= 1 - \frac{\texttt{aheadTot}}{\texttt{totalRed}} \\[4pt]
+    \vec{t} &= (1-\beta)\,\vec{p}_{\mathrm{ahead}} + \beta\,\vec{p}_{\perp}
+\end{align}
+On straight lines, $\beta \approx 0$ so the ahead centroid dominates. At sharp corners, $\beta \approx 0.5$--$0.8$ so the perpendicular centroid (new branch) takes over.
+
+\textbf{Step 6 --- Steering Vector.}
+From the image centre to the blended target:
+\begin{equation}
+    \vec{s} = \begin{pmatrix} c_r - t_{\mathrm{row}} \\ t_{\mathrm{col}} - c_c \end{pmatrix}, \quad
+    \hat{s} = \frac{\vec{s}}{|\vec{s}|}
+\end{equation}
+
+\textbf{Step 7 --- Smooth Heading Update.}
+The persistent heading blends $70\%$ new output with $30\%$ old heading:
+\begin{equation}
+    \vec{d}_{\mathrm{new}} = \frac{0.7\,\hat{s} + 0.3\,\vec{d}_{\mathrm{old}}}{|0.7\,\hat{s} + 0.3\,\vec{d}_{\mathrm{old}}|}
+\end{equation}
+This provides smooth transitions and prevents abrupt heading reversals.
+
+\subsection{Hyperparameters}
+
+\begin{table}[H]
+\centering
+\caption{Algorithm hyperparameters.}
+\label{tab:hyperparams}
+\footnotesize
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Description} \\
+\midrule
+Red threshold      & $R\!>\!180,G\!<\!100,B\!<\!100$ & Red pixel detection \\
+$\alpha$ (blend) & 0.7 & New output weight \\
+Min red pixels     & 15  & Keep last heading below \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+%  VI. RESULTS AND OBSERVATION
+% ============================================================================
+\section{Results and Observation}
+
+Table~\ref{tab:method_comparison} compares the three approaches across different turn severities.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of the three line-following methods.}
+\label{tab:method_comparison}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Method} & \textbf{Straight} & \textbf{90\degree} & \textbf{100\degree+} & \textbf{Angle Acc.} \\
+\midrule
+$7\times7$ Grid        & \checkmark & \checkmark & $\times$ & $\sim45\degree$ \\
+3-Strip Tangent        & \checkmark & \checkmark & $\times$ & $\sim5\degree$  \\
+Global+Perp Blend      & \checkmark & \checkmark & \checkmark & $\sim5\degree$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The $7\times7$ grid method suffered from $45\degree$ direction quantisation and could not handle sharp turns beyond $90\degree$. The 3-strip tangent method gave better angular accuracy by computing exact column-centroid differences, but its reliance on horizontal strips caused degraded performance on steep turns, failing entirely beyond $\sim90\degree$.
+
+The final method avoids both problems by computing heading-relative projections over the full image rather than fixed strips or a discrete grid. The adaptive blending between ahead and perpendicular centroids lets the algorithm follow straight lines normally (ahead centroid dominates) while switching to the perpendicular centroid at sharp corners where the new branch sticks out sideways. The persistent heading with $70/30$ blending prevents oscillation on straight sections while still permitting rapid direction changes at corners.
+
+Key observations:
+\begin{itemize}
+    \item The perpendicular centroid is critical for $>90\degree$ turns --- without it, the ahead centroid points backward along the old branch.
+    \item The $\beta$ blending ratio naturally increases as the turn sharpens, providing a smooth transition without explicit corner detection.
+    \item The minimum red pixel threshold (15) was not needed for this project's controlled environment, but was included as a safeguard for real-world scenarios where the line may be partially occluded or poorly lit.
+\end{itemize}
+
+The $\sim100\degree$ turn limit is not ideal --- real tracks can have sharper corners and even U-turns. This represents the best result achieved within the available development time; the approach of using global image data made the problem harder than expected (see Section~IV-C), and further refinement of the blending logic or a fundamentally different corner-handling strategy would be needed to push beyond this limit.
+
+% ============================================================================
+%  VII. FUTURE WORK
+% ============================================================================
+\section{Future Work}
+
+\begin{itemize}
+    \item \textbf{Adaptive thresholding}: The fixed $R>180$/$G<100$/$B<100$ threshold may fail under different lighting conditions. An adaptive threshold based on histogram analysis could improve robustness.
+    \item \textbf{Predictive steering}: Using velocity estimates to predict where the line will be 2--3 frames ahead, enabling smoother anticipation of turns.
+    \item \textbf{T-junction handling}: The current algorithm does not handle T-intersections. Adding fork detection and branch commitment logic would be needed for more complex track layouts.
+    \item \textbf{PID-based smoothing}: Integrating a PID controller on top of the vision output could reduce residual jitter.
+    \item \textbf{Angular clamping}: Adding a circular history buffer of past output directions and rejecting outputs that deviate $>90\degree$ from any recent direction could prevent U-turns at extreme corners.
+    \item \textbf{Sharp and U-turn handling}: The current algorithm fails beyond $\sim100\degree$. Handling turns up to $180\degree$ (full U-turns) is an important next step --- this likely requires detecting that the line doubles back and committing to the new branch rather than blending with the old one.
+\end{itemize}
+
+% ============================================================================
+%  CONCLUSION
+% ============================================================================
+\section*{Conclusion}
+
+A direction-independent, fixed-size-array-compatible line-following algorithm was developed for the Parrot Mambo minidrone. The final approach uses ahead and perpendicular centroid blending with a persistent heading to handle turns exceeding $100\degree$. Three approaches were explored --- a $7\times7$ grid scanner, a 3-strip tangent method, and the final centroid-blending method --- each iteration fixing failure modes found in the previous one. The algorithm is fully compatible with Simulink MATLAB Function blocks and requires no variable-size operations.
+
+\end{document}
