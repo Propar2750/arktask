@@ -2,8 +2,6 @@
 
 Submission for ARK (Aerial Robotics Kharagpur) perception tasks — three computer vision and drone control assignments.
 
-**Student ID:** 25HS10043
-
 ## Tasks
 
 ### Task 26_1 — Drone Line Following (MATLAB)
